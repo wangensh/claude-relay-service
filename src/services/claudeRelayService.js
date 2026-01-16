@@ -568,10 +568,13 @@ class ClaudeRelayService {
       }
 
       const makeRequestWithRetries = async (requestOptions) => {
-        const maxRetries = this._shouldRetryOn403(accountType) ? 2 : 0
-        let retryCount = 0
+        const maxRetries403 = this._shouldRetryOn403(accountType) ? this._getMax403Retries() : 0
+        const maxRetries401 = this._shouldRetryOn401(accountType) ? this._getMax401Retries() : 0
+        let retryCount403 = 0
+        let retryCount401 = 0
         let response
         let shouldRetry = false
+        let currentAccessToken = accessToken // 用于 401 刷新后的新 token
 
         do {
           // 🧹 每次重试从 bodyStore 解析新对象，避免闭包捕获
@@ -584,7 +587,7 @@ class ClaudeRelayService {
           }
           response = await this._makeClaudeRequest(
             retryRequestBody,
-            accessToken,
+            currentAccessToken, // 使用可能已刷新的 token
             proxyAgent,
             clientHeaders,
             accountId,
@@ -597,37 +600,90 @@ class ClaudeRelayService {
             }
           )
 
-          shouldRetry = response.statusCode === 403 && retryCount < maxRetries
-          if (shouldRetry) {
-            retryCount++
+          shouldRetry = false
+
+          // 🔄 401 重试逻辑（优先处理，因为可能需要刷新 token）
+          if (response.statusCode === 401 && retryCount401 < maxRetries401) {
+            retryCount401++
+
+            // 第一次 401 时尝试刷新 token
+            if (retryCount401 === 1) {
+              try {
+                logger.info(
+                  `🔄 401 error detected, attempting token refresh for account ${accountId}`
+                )
+                const refreshResult = await claudeAccountService.refreshAccountToken(accountId)
+                if (refreshResult && refreshResult.accessToken) {
+                  currentAccessToken = refreshResult.accessToken
+                  logger.info(`✅ Token refreshed successfully for account ${accountId}`)
+                }
+              } catch (refreshError) {
+                logger.warn(
+                  `⚠️ Token refresh failed for account ${accountId}: ${refreshError.message}`
+                )
+              }
+            }
+
+            const delayMs = this._calculate401RetryDelay(retryCount401)
             logger.warn(
-              `🔄 403 error for account ${accountId}, retry ${retryCount}/${maxRetries} after 2s`
+              `🔄 401 error for account ${accountId}, retry ${retryCount401}/${maxRetries401} after ${delayMs}ms`
             )
-            await this._sleep(2000)
+            await this._sleep(delayMs)
+            shouldRetry = true
+          }
+          // 🔄 403 重试逻辑
+          else if (response.statusCode === 403 && retryCount403 < maxRetries403) {
+            retryCount403++
+            const delayMs = this._calculate403RetryDelay(retryCount403)
+            logger.warn(
+              `🔄 403 error for account ${accountId}, retry ${retryCount403}/${maxRetries403} after ${delayMs}ms`
+            )
+            await this._sleep(delayMs)
+            shouldRetry = true
           }
         } while (shouldRetry)
 
-        return { response, retryCount }
+        return {
+          response,
+          retryCount: Math.max(retryCount401, retryCount403),
+          retryCount401,
+          retryCount403
+        }
       }
 
       let requestOptions = options
-      let { response, retryCount } = await makeRequestWithRetries(requestOptions)
+      let { response, retryCount, retryCount401, retryCount403 } =
+        await makeRequestWithRetries(requestOptions)
 
       if (
         this._isClaudeCodeCredentialError(response.body) &&
         requestOptions.useRandomizedToolNames !== true
       ) {
         requestOptions = { ...requestOptions, useRandomizedToolNames: true }
-        ;({ response, retryCount } = await makeRequestWithRetries(requestOptions))
+        ;({ response, retryCount, retryCount401, retryCount403 } =
+          await makeRequestWithRetries(requestOptions))
       }
 
       // 如果进行了重试，记录最终结果
-      if (retryCount > 0) {
-        if (response.statusCode === 403) {
-          logger.error(`🚫 403 error persists for account ${accountId} after ${retryCount} retries`)
+      if (retryCount401 > 0) {
+        if (response.statusCode === 401) {
+          logger.error(
+            `🚫 401 error persists for account ${accountId} after ${retryCount401} retries`
+          )
         } else {
           logger.info(
-            `✅ 403 retry successful for account ${accountId} on attempt ${retryCount}, got status ${response.statusCode}`
+            `✅ 401 retry successful for account ${accountId} on attempt ${retryCount401}, got status ${response.statusCode}`
+          )
+        }
+      }
+      if (retryCount403 > 0) {
+        if (response.statusCode === 403) {
+          logger.error(
+            `🚫 403 error persists for account ${accountId} after ${retryCount403} retries`
+          )
+        } else {
+          logger.info(
+            `✅ 403 retry successful for account ${accountId} on attempt ${retryCount403}, got status ${response.statusCode}`
           )
         }
       }
@@ -672,20 +728,23 @@ class ClaudeRelayService {
 
         // 检查是否为401状态码（未授权）
         if (response.statusCode === 401) {
-          logger.warn(`🔐 Unauthorized error (401) detected for account ${accountId}`)
+          logger.warn(
+            `🔐 Unauthorized error (401) detected for account ${accountId}${retryCount401 > 0 ? ` after ${retryCount401} retries` : ''}`
+          )
 
           // 记录401错误
           await this.recordUnauthorizedError(accountId)
 
-          // 检查是否需要标记为异常（遇到1次401就停止调度）
+          // 检查是否需要标记为异常
           const errorCount = await this.getUnauthorizedErrorCount(accountId)
           logger.info(
             `🔐 Account ${accountId} has ${errorCount} consecutive 401 errors in the last 5 minutes`
           )
 
-          if (errorCount >= 1) {
+          // 仅当重试后仍然失败时才标记账户（或者没有启用重试时直接标记）
+          if (retryCount401 > 0 || errorCount >= 1) {
             logger.error(
-              `❌ Account ${accountId} encountered 401 error (${errorCount} errors), marking as unauthorized`
+              `❌ Account ${accountId} encountered persistent 401 error (${errorCount} errors, ${retryCount401} retries), marking as unauthorized`
             )
             await unifiedClaudeScheduler.markAccountUnauthorized(
               accountId,
@@ -695,10 +754,10 @@ class ClaudeRelayService {
           }
         }
         // 检查是否为403状态码（禁止访问）
-        // 注意：如果进行了重试，retryCount > 0；这里的 403 是重试后最终的结果
+        // 注意：如果进行了重试，retryCount403 > 0；这里的 403 是重试后最终的结果
         else if (response.statusCode === 403) {
           logger.error(
-            `🚫 Forbidden error (403) detected for account ${accountId}${retryCount > 0 ? ` after ${retryCount} retries` : ''}, marking as blocked`
+            `🚫 Forbidden error (403) detected for account ${accountId}${retryCount403 > 0 ? ` after ${retryCount403} retries` : ''}, marking as blocked`
           )
           await unifiedClaudeScheduler.markAccountBlocked(accountId, accountType, sessionHash)
         }
@@ -1830,7 +1889,7 @@ class ClaudeRelayService {
     onResponseStart = null, // 📬 新增：收到响应头时的回调，用于提前释放队列锁
     retryCount = 0 // 🔄 403 重试计数器
   ) {
-    const maxRetries = 2 // 最大重试次数
+    const maxRetries = this._getMax403Retries() // 最大重试次数
     // 获取账户信息用于统一 User-Agent
     const account = await claudeAccountService.getAccount(accountId)
 
@@ -1948,6 +2007,85 @@ class ClaudeRelayService {
             }
           }
 
+          // 🔄 401 重试机制（必须在设置 res.on('data')/res.on('end') 之前处理）
+          if (res.statusCode === 401) {
+            const maxRetries401 = this._getMax401Retries()
+            const canRetry =
+              this._shouldRetryOn401(accountType) &&
+              retryCount < maxRetries401 &&
+              !responseStream.headersSent
+
+            if (canRetry) {
+              let newAccessToken = accessToken
+
+              // 第一次 401 时尝试刷新 token
+              if (retryCount === 0) {
+                try {
+                  logger.info(
+                    `🔄 [Stream] 401 error detected, attempting token refresh for account ${accountId}`
+                  )
+                  const refreshResult = await claudeAccountService.refreshAccountToken(accountId)
+                  if (refreshResult && refreshResult.accessToken) {
+                    newAccessToken = refreshResult.accessToken
+                    logger.info(`✅ [Stream] Token refreshed successfully for account ${accountId}`)
+                  }
+                } catch (refreshError) {
+                  logger.warn(
+                    `⚠️ [Stream] Token refresh failed for account ${accountId}: ${refreshError.message}`
+                  )
+                }
+              }
+
+              const delayMs = this._calculate401RetryDelay(retryCount + 1)
+              logger.warn(
+                `🔄 [Stream] 401 error for account ${accountId}, retry ${retryCount + 1}/${maxRetries401} after ${delayMs}ms`
+              )
+              // 消费当前响应并销毁请求
+              res.resume()
+              req.destroy()
+
+              // 等待指定延迟后递归重试（指数退避）
+              await this._sleep(delayMs)
+
+              try {
+                // 递归调用自身进行重试
+                if (
+                  !requestOptions.bodyStoreId ||
+                  !this.bodyStore.has(requestOptions.bodyStoreId)
+                ) {
+                  throw new Error('401 retry requires valid bodyStoreId')
+                }
+                let retryBody
+                try {
+                  retryBody = JSON.parse(this.bodyStore.get(requestOptions.bodyStoreId))
+                } catch (parseError) {
+                  logger.error(`❌ Failed to parse body for 401 retry: ${parseError.message}`)
+                  throw new Error(`401 retry body parse failed: ${parseError.message}`)
+                }
+                const retryResult = await this._makeClaudeStreamRequestWithUsageCapture(
+                  retryBody,
+                  newAccessToken, // 使用可能已刷新的 token
+                  proxyAgent,
+                  clientHeaders,
+                  responseStream,
+                  usageCallback,
+                  accountId,
+                  accountType,
+                  sessionHash,
+                  streamTransformer,
+                  requestOptions,
+                  isDedicatedOfficialAccount,
+                  onResponseStart,
+                  retryCount + 1
+                )
+                resolve(retryResult)
+              } catch (retryError) {
+                reject(retryError)
+              }
+              return // 重要：提前返回，不设置后续的错误处理器
+            }
+          }
+
           // 🔄 403 重试机制（必须在设置 res.on('data')/res.on('end') 之前处理）
           // 否则重试时旧响应的 on('end') 会与新请求产生竞态条件
           if (res.statusCode === 403) {
@@ -1957,15 +2095,16 @@ class ClaudeRelayService {
               !responseStream.headersSent
 
             if (canRetry) {
+              const delayMs = this._calculate403RetryDelay(retryCount + 1)
               logger.warn(
-                `🔄 [Stream] 403 error for account ${accountId}, retry ${retryCount + 1}/${maxRetries} after 2s`
+                `🔄 [Stream] 403 error for account ${accountId}, retry ${retryCount + 1}/${maxRetries} after ${delayMs}ms`
               )
               // 消费当前响应并销毁请求
               res.resume()
               req.destroy()
 
-              // 等待 2 秒后递归重试
-              await this._sleep(2000)
+              // 等待指定延迟后递归重试（指数退避）
+              await this._sleep(delayMs)
 
               try {
                 // 递归调用自身进行重试
@@ -1974,14 +2113,14 @@ class ClaudeRelayService {
                   !requestOptions.bodyStoreId ||
                   !this.bodyStore.has(requestOptions.bodyStoreId)
                 ) {
-                  throw new Error('529 retry requires valid bodyStoreId')
+                  throw new Error('403 retry requires valid bodyStoreId')
                 }
                 let retryBody
                 try {
                   retryBody = JSON.parse(this.bodyStore.get(requestOptions.bodyStoreId))
                 } catch (parseError) {
-                  logger.error(`❌ Failed to parse body for 529 retry: ${parseError.message}`)
-                  throw new Error(`529 retry body parse failed: ${parseError.message}`)
+                  logger.error(`❌ Failed to parse body for 403 retry: ${parseError.message}`)
+                  throw new Error(`403 retry body parse failed: ${parseError.message}`)
                 }
                 const retryResult = await this._makeClaudeStreamRequestWithUsageCapture(
                   retryBody,
@@ -2010,7 +2149,11 @@ class ClaudeRelayService {
           // 将错误处理逻辑封装在一个异步函数中
           const handleErrorResponse = async () => {
             if (res.statusCode === 401) {
-              logger.warn(`🔐 [Stream] Unauthorized error (401) detected for account ${accountId}`)
+              // 401 处理：走到这里说明重试已用尽或不适用重试，标记 unauthorized
+              // 注意：重试逻辑已在 handleErrorResponse 外部提前处理
+              logger.warn(
+                `🔐 [Stream] Unauthorized error (401) detected for account ${accountId}${retryCount > 0 ? ` after ${retryCount} retries` : ''}`
+              )
 
               await this.recordUnauthorizedError(accountId)
 
@@ -2019,9 +2162,10 @@ class ClaudeRelayService {
                 `🔐 [Stream] Account ${accountId} has ${errorCount} consecutive 401 errors in the last 5 minutes`
               )
 
-              if (errorCount >= 1) {
+              // 仅当重试后仍然失败时才标记账户（或者没有启用重试时直接标记）
+              if (retryCount > 0 || errorCount >= 1) {
                 logger.error(
-                  `❌ [Stream] Account ${accountId} encountered 401 error (${errorCount} errors), marking as unauthorized`
+                  `❌ [Stream] Account ${accountId} encountered persistent 401 error (${errorCount} errors, ${retryCount} retries), marking as unauthorized`
                 )
                 await unifiedClaudeScheduler.markAccountUnauthorized(
                   accountId,
@@ -3133,6 +3277,51 @@ class ClaudeRelayService {
   // ⏱️ 等待指定毫秒数
   _sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms))
+  }
+
+  // 🔄 403 重试配置
+  static RETRY_403_CONFIG = {
+    initialDelayMs: 200,
+    backoffFactor: 2.0,
+    maxDelayMs: 3000,
+    maxRetries: 6
+  }
+
+  // 🔢 获取最大 403 重试次数
+  _getMax403Retries() {
+    return ClaudeRelayService.RETRY_403_CONFIG.maxRetries
+  }
+
+  // ⏱️ 计算 403 重试延迟（指数退避）
+  _calculate403RetryDelay(retryCount) {
+    const { initialDelayMs, backoffFactor, maxDelayMs } = ClaudeRelayService.RETRY_403_CONFIG
+    const delay = initialDelayMs * Math.pow(backoffFactor, retryCount - 1)
+    return Math.min(delay, maxDelayMs)
+  }
+
+  // 🔄 401 重试配置
+  static RETRY_401_CONFIG = {
+    initialDelayMs: 500,
+    backoffFactor: 2.0,
+    maxDelayMs: 4000,
+    maxRetries: 2
+  }
+
+  // 🔢 获取最大 401 重试次数
+  _getMax401Retries() {
+    return ClaudeRelayService.RETRY_401_CONFIG.maxRetries
+  }
+
+  // ⏱️ 计算 401 重试延迟（指数退避）
+  _calculate401RetryDelay(retryCount) {
+    const { initialDelayMs, backoffFactor, maxDelayMs } = ClaudeRelayService.RETRY_401_CONFIG
+    const delay = initialDelayMs * Math.pow(backoffFactor, retryCount - 1)
+    return Math.min(delay, maxDelayMs)
+  }
+
+  // 🔄 判断账户是否应该在 401 错误时进行重试
+  _shouldRetryOn401(accountType) {
+    return accountType === 'claude-official'
   }
 }
 
