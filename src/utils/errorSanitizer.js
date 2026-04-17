@@ -1,9 +1,23 @@
 /**
- * 错误消息清理工具 - 白名单错误码制
- * 所有错误映射到预定义的标准错误码，原始消息只记日志不返回前端
+ * 错误消息清理工具 - 分层策略
+ *
+ * 策略：
+ * - 客户端错误（4xx：400/404/422/429/401/403）: 保留上游原始结构与消息，
+ *   仅做字符串级供应商标识脱敏（剔除 `[vendor/route]` 这类路由前缀）。
+ *   原因：这类错误描述的是用户请求本身的问题，SDK 需要 Anthropic 标准
+ *   `{type:"error", error:{type, message}}` 格式才能正确解析和提示用户。
+ * - 服务端错误（5xx/529）和网络错误 / 未知格式: 走白名单错误码映射，
+ *   用预定义的标准消息替换原始内容，避免泄漏上游供应商细节与抖动状态。
  */
 
 const logger = require('./logger')
+
+// 供应商路由前缀的正则，与 upstreamErrorHelper.sanitizeErrorForClient 一致
+// 匹配形如 " [foo/bar]" 的片段
+const VENDOR_ROUTE_PATTERN = / \[[^\]/]+\/[^\]]+\]/g
+
+// 可以原样透传的客户端错误 HTTP 状态码集合
+const PASSTHROUGH_STATUS_CODES = new Set([400, 401, 403, 404, 409, 413, 422, 429])
 
 // 标准错误码定义
 const ERROR_CODES = {
@@ -78,7 +92,12 @@ function mapToErrorCode(error, options = {}) {
   // 提取原始错误信息
   const originalMessage = extractOriginalMessage(error)
   const errorCode = error?.code || error?.response?.status
-  const statusCode = error?.response?.status || error?.status || error?.statusCode
+  // 优先使用调用方显式传入的 statusCode（比从 error body 里猜更可靠）
+  const statusCode =
+    (Number.isFinite(options.statusCode) ? options.statusCode : null) ||
+    error?.response?.status ||
+    error?.status ||
+    error?.statusCode
 
   // 记录原始错误到日志（供调试）
   if (logOriginal && originalMessage) {
@@ -174,19 +193,123 @@ function extractOriginalMessage(error) {
 }
 
 /**
+ * 对字符串做供应商路由前缀脱敏（如 " [codex/openrouter]" -> "")
+ */
+function stripVendorPrefix(text) {
+  if (typeof text !== 'string' || !text) {
+    return text
+  }
+  return text.replace(VENDOR_ROUTE_PATTERN, '')
+}
+
+/**
+ * 判断是否为 Anthropic 标准错误 schema：`{type:"error", error:{type, message}}`
+ */
+function isAnthropicErrorSchema(data) {
+  return Boolean(
+    data &&
+      typeof data === 'object' &&
+      data.type === 'error' &&
+      data.error &&
+      typeof data.error === 'object' &&
+      typeof data.error.type === 'string' &&
+      typeof data.error.message === 'string'
+  )
+}
+
+/**
+ * 判断是否为 OpenAI 风格错误 schema：`{error:{message, type?, code?}}`
+ */
+function isOpenAIErrorSchema(data) {
+  return Boolean(
+    data &&
+      typeof data === 'object' &&
+      data.error &&
+      typeof data.error === 'object' &&
+      typeof data.error.message === 'string'
+  )
+}
+
+/**
+ * 客户端错误透传：保留结构，对 message 字符串做供应商脱敏
+ * 若传入的对象是已知的标准 schema，就按 schema 保留；否则回退到白名单映射
+ */
+function passthroughClientError(errorData) {
+  if (isAnthropicErrorSchema(errorData)) {
+    return {
+      type: 'error',
+      error: {
+        type: errorData.error.type,
+        message: stripVendorPrefix(errorData.error.message)
+      }
+    }
+  }
+  if (isOpenAIErrorSchema(errorData)) {
+    const inner = { ...errorData.error }
+    if (typeof inner.message === 'string') {
+      inner.message = stripVendorPrefix(inner.message)
+    }
+    return { error: inner }
+  }
+  return null
+}
+
+// 白名单 code 到 Anthropic 标准 error.type 的映射
+const ANTHROPIC_ERROR_TYPE_BY_STATUS = {
+  400: 'invalid_request_error',
+  401: 'authentication_error',
+  403: 'permission_error',
+  404: 'not_found_error',
+  409: 'api_error',
+  413: 'request_too_large',
+  422: 'invalid_request_error',
+  429: 'rate_limit_error',
+  500: 'api_error',
+  502: 'api_error',
+  503: 'overloaded_error',
+  504: 'api_error',
+  529: 'overloaded_error'
+}
+
+function anthropicErrorType(statusCode) {
+  return ANTHROPIC_ERROR_TYPE_BY_STATUS[statusCode] || 'api_error'
+}
+
+/**
  * 创建安全的错误响应对象
+ *
+ * 输出统一为 Anthropic 标准格式：`{type:"error", error:{type, message}}`
+ * - 4xx 客户端错误：透传上游原始 type/message（仅消息做供应商前缀脱敏）
+ * - 5xx/未知：用白名单消息替换（保持供应商隐匿），但 schema 仍是 Anthropic 标准
+ *
  * @param {Error|string|object} error - 原始错误
  * @param {object} options - 选项
- * @returns {{ error: { code: string, message: string }, status: number }}
+ * @param {number} [options.statusCode] - HTTP 状态码（建议传入，用于 schema 映射和 4xx 透传判断）
  */
 function createSafeErrorResponse(error, options = {}) {
+  const { statusCode } = options
+  // 4xx 客户端错误：透传原始结构（仅消息脱敏）
+  if (
+    Number.isFinite(statusCode) &&
+    PASSTHROUGH_STATUS_CODES.has(statusCode) &&
+    error &&
+    typeof error === 'object'
+  ) {
+    const passthrough = passthroughClientError(error)
+    if (passthrough) {
+      return passthrough
+    }
+  }
+  // 默认：白名单映射（5xx/529/未知 schema/网络错误），用 Anthropic 标准 schema 输出
   const mapped = mapToErrorCode(error, options)
+  const effectiveStatus = Number.isFinite(statusCode) ? statusCode : mapped.status
   return {
+    type: 'error',
     error: {
-      code: mapped.code,
-      message: mapped.message
-    },
-    status: mapped.status
+      type: anthropicErrorType(effectiveStatus),
+      message: mapped.message,
+      code: mapped.code
+    }
   }
 }
 
@@ -215,16 +338,28 @@ function getSafeMessage(error, options = {}) {
   return mapToErrorCode(error, options).message
 }
 
-// 兼容旧接口
-function sanitizeErrorMessage(message) {
+/**
+ * 兼容旧接口：清洗错误消息字符串
+ * @param {string} message - 原始消息
+ * @param {number} [statusCode] - HTTP 状态码。4xx 时仅做供应商前缀脱敏；其它情况走白名单
+ */
+function sanitizeErrorMessage(message, statusCode) {
   if (!message) {
     return 'Service temporarily unavailable'
+  }
+  if (Number.isFinite(statusCode) && PASSTHROUGH_STATUS_CODES.has(statusCode)) {
+    return stripVendorPrefix(typeof message === 'string' ? message : String(message))
   }
   return mapToErrorCode({ message }, { logOriginal: false }).message
 }
 
-function sanitizeUpstreamError(errorData) {
-  return createSafeErrorResponse(errorData, { logOriginal: false })
+/**
+ * 兼容旧接口：清洗上游错误对象
+ * @param {object} errorData - 原始错误对象
+ * @param {number} [statusCode] - HTTP 状态码。4xx 时透传原始结构（仅消息脱敏）；其它走白名单
+ */
+function sanitizeUpstreamError(errorData, statusCode) {
+  return createSafeErrorResponse(errorData, { logOriginal: false, statusCode })
 }
 
 function extractErrorMessage(body) {
@@ -253,10 +388,14 @@ function isAccountDisabledError(statusCode, body) {
 
 module.exports = {
   ERROR_CODES,
+  PASSTHROUGH_STATUS_CODES,
   mapToErrorCode,
   createSafeErrorResponse,
   createSafeSSEError,
   getSafeMessage,
+  stripVendorPrefix,
+  isAnthropicErrorSchema,
+  isOpenAIErrorSchema,
   // 兼容旧接口
   sanitizeErrorMessage,
   sanitizeUpstreamError,

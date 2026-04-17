@@ -1830,7 +1830,7 @@ router.post('/v1/messages/count_tokens', authenticateApiKey, async (req, res) =>
     try {
       const jsonData = JSON.parse(response.body)
       if (response.statusCode < 200 || response.statusCode >= 300) {
-        const sanitizedData = sanitizeUpstreamError(jsonData)
+        const sanitizedData = sanitizeUpstreamError(jsonData, response.statusCode)
         res.json(sanitizedData)
       } else {
         res.json(jsonData)
