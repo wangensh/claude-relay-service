@@ -8,6 +8,7 @@ const logger = require('../../utils/logger')
 const { parseVendorPrefixedModel, isOpus45OrNewer } = require('../../utils/modelHelper')
 const { isSchedulable, sortAccountsByPriority } = require('../../utils/commonHelper')
 const upstreamErrorHelper = require('../../utils/upstreamErrorHelper')
+const circuitBreaker = require('../../utils/circuitBreaker')
 
 /**
  * Check if account is Pro (not Max)
@@ -451,7 +452,8 @@ class UnifiedClaudeScheduler {
 
       return {
         accountId: selectedAccount.accountId,
-        accountType: selectedAccount.accountType
+        accountType: selectedAccount.accountType,
+        probe: selectedAccount.__probe === true
       }
     } catch (error) {
       logger.error('❌ Failed to select account for API key:', error)
@@ -753,10 +755,20 @@ class UnifiedClaudeScheduler {
           'claude-console'
         )
         if (isTempUnavailable) {
-          logger.debug(
-            `⏭️ Skipping Claude Console account ${currentAccount.name} - temporarily unavailable`
+          // 🧯 熔断器 half-open：若冷却窗已到，允许恰好一个探测请求通过
+          const probeGranted = await circuitBreaker
+            .tryAcquireProbe(currentAccount.id)
+            .catch(() => false)
+          if (!probeGranted) {
+            logger.debug(
+              `⏭️ Skipping Claude Console account ${currentAccount.name} - temporarily unavailable`
+            )
+            continue
+          }
+          logger.info(
+            `🟡 Half-open probe granted to Claude Console account ${currentAccount.name} (${currentAccount.id})`
           )
-          continue
+          currentAccount.__probe = true
         }
 
         // 检查是否被限流
@@ -780,7 +792,8 @@ class UnifiedClaudeScheduler {
               accountId: currentAccount.id,
               accountType: 'claude-console',
               priority: parseInt(currentAccount.priority) || 50,
-              lastUsedAt: currentAccount.lastUsedAt || '0'
+              lastUsedAt: currentAccount.lastUsedAt || '0',
+              __probe: currentAccount.__probe === true
             })
             logger.info(
               `✅ Added Claude Console account to available pool: ${currentAccount.name} (priority: ${currentAccount.priority}, no concurrency limit)`
@@ -826,7 +839,8 @@ class UnifiedClaudeScheduler {
             accountId: account.id,
             accountType: 'claude-console',
             priority: parseInt(account.priority) || 50,
-            lastUsedAt: account.lastUsedAt || '0'
+            lastUsedAt: account.lastUsedAt || '0',
+            __probe: account.__probe === true
           })
           logger.info(
             `✅ Added Claude Console account to available pool: ${account.name} (priority: ${account.priority}, concurrency: ${currentConcurrency}/${account.maxConcurrentTasks})`
@@ -1645,7 +1659,8 @@ class UnifiedClaudeScheduler {
 
       return {
         accountId: selectedAccount.accountId,
-        accountType: selectedAccount.accountType
+        accountType: selectedAccount.accountType,
+        probe: selectedAccount.__probe === true
       }
     } catch (error) {
       logger.error(`❌ Failed to select account from group ${groupId}:`, error)

@@ -10,6 +10,7 @@ const {
   isAccountDisabledError
 } = require('../../utils/errorSanitizer')
 const upstreamErrorHelper = require('../../utils/upstreamErrorHelper')
+const circuitBreaker = require('../../utils/circuitBreaker')
 const userMessageQueueService = require('../userMessageQueueService')
 const { isStreamWritable } = require('../../utils/streamHelper')
 const { filterForClaude } = require('../../utils/headerFilter')
@@ -265,7 +266,27 @@ class ClaudeConsoleRelayService {
         '📤 Sending request to Claude Console API with headers:',
         JSON.stringify(requestConfig.headers, null, 2)
       )
-      const response = await axios(requestConfig)
+
+      // 🧯 熔断器 L1：瞬时错误请求级重试
+      const policy = claudeConsoleAccountService.resolveErrorPolicy(account)
+      const retryAttempts = autoProtectionDisabled ? 0 : policy.retryOnTransient || 0
+      // 判定此次请求是否是 half-open 探测请求（调度器已经通过 tryAcquireProbe 占位）
+      const isProbeRequest = autoProtectionDisabled
+        ? false
+        : await circuitBreaker.consumeProbeFlag(accountId).catch(() => false)
+      if (isProbeRequest) {
+        logger.info(
+          `🟡 [Console] Handling half-open probe request for account ${account?.name || accountId}`
+        )
+      }
+      const response = await circuitBreaker.withRetry(() => axios(requestConfig), {
+        attempts: retryAttempts,
+        onRetry: ({ attempt, statusCode, error }) => {
+          logger.info(
+            `🔁 [Console] Retry ${attempt}/${retryAttempts} for account ${account?.name || accountId} after ${statusCode || error?.code || 'transient'}`
+          )
+        }
+      })
 
       // 📬 请求已发送成功，立即释放队列锁（无需等待响应处理完成）
       // 因为 Claude API 限流基于请求发送时刻计算（RPM），不是请求完成时刻
@@ -312,12 +333,12 @@ class ClaudeConsoleRelayService {
         try {
           const responseData =
             typeof response.data === 'string' ? JSON.parse(response.data) : response.data
-          const sanitizedData = sanitizeUpstreamError(responseData)
+          const sanitizedData = sanitizeUpstreamError(responseData, response.status)
           logger.error(`🧹 [SANITIZED] Error response to client: ${JSON.stringify(sanitizedData)}`)
         } catch (e) {
           const rawText =
             typeof response.data === 'string' ? response.data : JSON.stringify(response.data)
-          const sanitizedText = sanitizeErrorMessage(rawText)
+          const sanitizedText = sanitizeErrorMessage(rawText, response.status)
           logger.error(`🧹 [SANITIZED] Error response to client: ${sanitizedText}`)
         }
       } else {
@@ -369,34 +390,25 @@ class ClaudeConsoleRelayService {
             )
             .catch(() => {})
         }
-      } else if (response.status === 529) {
+      } else if (response.status === 529 || response.status >= 500) {
         logger.warn(
-          `🚫 Overload error detected for Claude Console account ${accountId}${autoProtectionDisabled ? ' (auto-protection disabled, skipping status change)' : ''}`
+          `🔥 Transient/overload (${response.status}) for Claude Console account ${accountId}${autoProtectionDisabled ? ' (auto-protection disabled, skipping circuit breaker)' : ''}`
         )
         if (!autoProtectionDisabled) {
-          await claudeConsoleAccountService.markAccountOverloaded(accountId)
-          await upstreamErrorHelper
-            .markTempUnavailable(accountId, 'claude-console', 529)
-            .catch(() => {})
-        }
-      } else if (response.status >= 500) {
-        logger.warn(
-          `🔥 Server error (${response.status}) detected for Claude Console account ${accountId}${autoProtectionDisabled ? ' (auto-protection disabled, skipping status change)' : ''}`
-        )
-        if (!autoProtectionDisabled) {
-          await upstreamErrorHelper
-            .markTempUnavailable(accountId, 'claude-console', response.status)
-            .catch(() => {})
+          await circuitBreaker
+            .recordFailure(accountId, response.status, { probe: isProbeRequest })
+            .catch((err) => logger.warn(`circuitBreaker.recordFailure failed: ${err.message}`))
         }
       } else if (response.status === 200 || response.status === 201) {
         // 如果请求成功，检查并移除错误状态
+        if (!autoProtectionDisabled) {
+          await circuitBreaker
+            .recordSuccess(accountId, { probe: isProbeRequest })
+            .catch((err) => logger.warn(`circuitBreaker.recordSuccess failed: ${err.message}`))
+        }
         const isRateLimited = await claudeConsoleAccountService.isAccountRateLimited(accountId)
         if (isRateLimited) {
           await claudeConsoleAccountService.removeAccountRateLimit(accountId)
-        }
-        const isOverloaded = await claudeConsoleAccountService.isAccountOverloaded(accountId)
-        if (isOverloaded) {
-          await claudeConsoleAccountService.removeAccountOverload(accountId)
         }
       }
 
@@ -410,14 +422,14 @@ class ClaudeConsoleRelayService {
         try {
           const responseData =
             typeof response.data === 'string' ? JSON.parse(response.data) : response.data
-          const sanitizedData = sanitizeUpstreamError(responseData)
+          const sanitizedData = sanitizeUpstreamError(responseData, response.status)
           responseBody = JSON.stringify(sanitizedData)
           logger.debug(`🧹 Sanitized error response`)
         } catch (parseError) {
           // 如果无法解析为JSON，尝试清理文本
           const rawText =
             typeof response.data === 'string' ? response.data : JSON.stringify(response.data)
-          responseBody = sanitizeErrorMessage(rawText)
+          responseBody = sanitizeErrorMessage(rawText, response.status)
           logger.debug(`🧹 Sanitized error text`)
         }
       } else {
@@ -753,6 +765,21 @@ class ClaudeConsoleRelayService {
     requestOptions = {},
     onResponseHeaderReceived = null
   ) {
+    // 🧯 熔断器 L1：流式瞬时错误请求级重试（仅在尚未向客户端下发字节时）
+    const autoProtectionDisabledStream = account.disableAutoProtection === true
+    const streamPolicy = claudeConsoleAccountService.resolveErrorPolicy(account)
+    const streamRetryAttempts = autoProtectionDisabledStream
+      ? 0
+      : streamPolicy.retryOnTransient || 0
+    const isProbeRequestStream = autoProtectionDisabledStream
+      ? false
+      : await circuitBreaker.consumeProbeFlag(accountId).catch(() => false)
+    if (isProbeRequestStream) {
+      logger.info(
+        `🟡 [Console Stream] Handling half-open probe request for account ${account?.name || accountId}`
+      )
+    }
+
     return new Promise((resolve, reject) => {
       let aborted = false
 
@@ -811,8 +838,36 @@ class ClaudeConsoleRelayService {
         requestConfig.headers['anthropic-beta'] = requestOptions.betaHeader
       }
 
-      // 发送请求
-      const request = axios(requestConfig)
+      const attemptStreamRequest = async () => {
+        let attempt = 0
+        while (true) {
+          const response = await axios(requestConfig)
+          const shouldRetry =
+            attempt < streamRetryAttempts &&
+            !responseStream.headersSent &&
+            circuitBreaker.isTransient(response.status)
+          if (!shouldRetry) {
+            return response
+          }
+          // 耗尽并丢弃错误 body 以释放 socket，然后重试
+          try {
+            await new Promise((res) => {
+              response.data.on('data', () => {})
+              response.data.on('end', res)
+              response.data.on('error', res)
+            })
+          } catch {
+            // ignore drain errors
+          }
+          attempt++
+          logger.info(
+            `🔁 [Console Stream] Retry ${attempt}/${streamRetryAttempts} for account ${account?.name || accountId} after status ${response.status}`
+          )
+          await new Promise((res) => setTimeout(res, attempt === 1 ? 50 : 200))
+        }
+      }
+
+      const request = attemptStreamRequest()
 
       // 注意：使用 .then(async ...) 模式处理响应
       // - 内部的 releaseQueueLock 有独立的 try-catch，不会导致未捕获异常
@@ -888,24 +943,16 @@ class ClaudeConsoleRelayService {
                     )
                     .catch(() => {})
                 }
-              } else if (response.status === 529) {
+              } else if (response.status === 529 || response.status >= 500) {
                 logger.warn(
-                  `🚫 [Stream] Overload error detected for Claude Console account ${accountId}${autoProtectionDisabled ? ' (auto-protection disabled, skipping status change)' : ''}`
+                  `🔥 [Stream] Transient/overload (${response.status}) for Claude Console account ${accountId}${autoProtectionDisabled ? ' (auto-protection disabled, skipping circuit breaker)' : ''}`
                 )
                 if (!autoProtectionDisabled) {
-                  await claudeConsoleAccountService.markAccountOverloaded(accountId)
-                  await upstreamErrorHelper
-                    .markTempUnavailable(accountId, 'claude-console', 529)
-                    .catch(() => {})
-                }
-              } else if (response.status >= 500) {
-                logger.warn(
-                  `🔥 [Stream] Server error (${response.status}) detected for Claude Console account ${accountId}${autoProtectionDisabled ? ' (auto-protection disabled, skipping status change)' : ''}`
-                )
-                if (!autoProtectionDisabled) {
-                  await upstreamErrorHelper
-                    .markTempUnavailable(accountId, 'claude-console', response.status)
-                    .catch(() => {})
+                  await circuitBreaker
+                    .recordFailure(accountId, response.status, { probe: isProbeRequestStream })
+                    .catch((err) =>
+                      logger.warn(`circuitBreaker.recordFailure failed: ${err.message}`)
+                    )
                 }
               }
 
@@ -921,7 +968,7 @@ class ClaudeConsoleRelayService {
               try {
                 const fullErrorData = Buffer.concat(errorChunks).toString()
                 const errorJson = JSON.parse(fullErrorData)
-                const sanitizedError = sanitizeUpstreamError(errorJson)
+                const sanitizedError = sanitizeUpstreamError(errorJson, response.status)
 
                 // 记录清理后的错误消息（发送给客户端的，完整记录）
                 logger.error(
@@ -933,7 +980,7 @@ class ClaudeConsoleRelayService {
                   responseStream.end()
                 }
               } catch (parseError) {
-                const sanitizedText = sanitizeErrorMessage(errorDataForCheck)
+                const sanitizedText = sanitizeErrorMessage(errorDataForCheck, response.status)
                 logger.error(`🧹 [Stream] [SANITIZED] Error response to client: ${sanitizedText}`)
 
                 if (isStreamWritable(responseStream)) {
@@ -960,15 +1007,15 @@ class ClaudeConsoleRelayService {
             }
           }
 
-          // 成功响应，检查并移除错误状态
+          // 成功响应，检查并移除错误状态 + 通知熔断器
+          if (!autoProtectionDisabledStream) {
+            circuitBreaker
+              .recordSuccess(accountId, { probe: isProbeRequestStream })
+              .catch((err) => logger.warn(`circuitBreaker.recordSuccess failed: ${err.message}`))
+          }
           claudeConsoleAccountService.isAccountRateLimited(accountId).then((isRateLimited) => {
             if (isRateLimited) {
               claudeConsoleAccountService.removeAccountRateLimit(accountId)
-            }
-          })
-          claudeConsoleAccountService.isAccountOverloaded(accountId).then((isOverloaded) => {
-            if (isOverloaded) {
-              claudeConsoleAccountService.removeAccountOverload(accountId)
             }
           })
 

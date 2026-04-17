@@ -1639,6 +1639,11 @@
                 v-model:temp-unavailable-503-ttl-seconds="form.tempUnavailable503TtlSeconds"
                 v-model:temp-unavailable-5xx-ttl-seconds="form.tempUnavailable5xxTtlSeconds"
               />
+              <CircuitBreakerPolicyFields
+                v-if="form.platform === 'claude-console'"
+                v-model:error-policy="form.errorPolicy"
+                v-model:upstream-type="form.upstreamType"
+              />
             </div>
 
             <!-- OpenAI-Responses 特定字段 -->
@@ -3423,6 +3428,11 @@
             v-model:temp-unavailable-503-ttl-seconds="form.tempUnavailable503TtlSeconds"
             v-model:temp-unavailable-5xx-ttl-seconds="form.tempUnavailable5xxTtlSeconds"
           />
+          <CircuitBreakerPolicyFields
+            v-if="form.platform === 'claude-console'"
+            v-model:error-policy="form.errorPolicy"
+            v-model:upstream-type="form.upstreamType"
+          />
 
           <!-- OpenAI-Responses 特定字段（编辑模式）-->
           <div v-if="form.platform === 'openai-responses'" class="space-y-4">
@@ -4050,6 +4060,7 @@ import { useAccountsStore } from '@/stores/accounts'
 import ProxyConfig from './ProxyConfig.vue'
 import OAuthFlow from './OAuthFlow.vue'
 import TempUnavailablePolicyFields from './TempUnavailablePolicyFields.vue'
+import CircuitBreakerPolicyFields from './CircuitBreakerPolicyFields.vue'
 import ConfirmModal from '@/components/common/ConfirmModal.vue'
 import GroupManagementModal from './GroupManagementModal.vue'
 import ApiKeyManagementModal from './ApiKeyManagementModal.vue'
@@ -4370,6 +4381,11 @@ const form = ref({
   tempUnavailable5xxTtlSeconds: toFormCooldownOverrideValue(
     props.account?.tempUnavailable5xxTtlSeconds
   ),
+  upstreamType: props.account?.upstreamType || 'adaptive',
+  errorPolicy:
+    props.account?.errorPolicy && typeof props.account.errorPolicy === 'object'
+      ? { ...props.account.errorPolicy }
+      : null,
   // 额度管理字段
   dailyQuota: props.account?.dailyQuota || 0,
   dailyUsage: props.account?.dailyUsage || 0,
@@ -5511,6 +5527,12 @@ const createAccount = async () => {
       data.rateLimitDuration = form.value.enableRateLimit ? form.value.rateLimitDuration || 60 : 0
       if (form.value.platform === 'claude-console') {
         data.interceptWarmup = !!form.value.interceptWarmup
+        // 熔断器字段（仅 claude-console）
+        data.upstreamType = form.value.upstreamType || 'adaptive'
+        data.errorPolicy =
+          form.value.errorPolicy && Object.keys(form.value.errorPolicy).length > 0
+            ? form.value.errorPolicy
+            : null
       }
       // 额度管理字段
       data.dailyQuota = form.value.dailyQuota || 0
@@ -5865,6 +5887,12 @@ const updateAccount = async () => {
       data.quotaResetTime = form.value.quotaResetTime || '00:00'
       // 并发控制字段
       data.maxConcurrentTasks = form.value.maxConcurrentTasks || 0
+      // 熔断器字段
+      data.upstreamType = form.value.upstreamType || 'adaptive'
+      data.errorPolicy =
+        form.value.errorPolicy && Object.keys(form.value.errorPolicy).length > 0
+          ? form.value.errorPolicy
+          : null
     }
 
     // OpenAI-Responses 特定更新

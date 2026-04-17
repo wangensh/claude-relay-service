@@ -239,6 +239,43 @@ const config = {
     overloadTtlSeconds: parseInt(process.env.UPSTREAM_ERROR_OVERLOAD_TTL_SECONDS) || 600, // 529过载暂停秒数
     authErrorTtlSeconds: parseInt(process.env.UPSTREAM_ERROR_AUTH_TTL_SECONDS) || 1800, // 401/403认证错误暂停秒数
     timeoutTtlSeconds: parseInt(process.env.UPSTREAM_ERROR_TIMEOUT_TTL_SECONDS) || 300 // 504超时暂停秒数
+  },
+
+  // 🧯 Claude Console 熔断器配置
+  // 说明：仅作用于 Claude Console 账户（聚合型上游常见）。三档 preset 由 upstreamType 选择，
+  // 账户级 errorPolicy 可覆盖 preset 中的任意字段。设 enabled=false 可整体关闭回落到旧行为。
+  circuitBreaker: {
+    enabled: process.env.CONSOLE_CIRCUIT_BREAKER_ENABLED !== 'false', // 默认启用
+    defaultUpstreamType: process.env.CONSOLE_CIRCUIT_BREAKER_DEFAULT_TYPE || 'adaptive',
+    presets: {
+      direct: {
+        retryOnTransient: 0,
+        window: 60,
+        minSamples: 5,
+        errorRateThreshold: 0.4,
+        consecutiveFailureThreshold: 3,
+        openCooldown: 300,
+        openCooldownMax: 1800
+      },
+      adaptive: {
+        retryOnTransient: 1,
+        window: 60,
+        minSamples: 10,
+        errorRateThreshold: 0.5,
+        consecutiveFailureThreshold: 5,
+        openCooldown: 30,
+        openCooldownMax: 600
+      },
+      aggregator: {
+        retryOnTransient: 2,
+        window: 60,
+        minSamples: 15,
+        errorRateThreshold: 0.7,
+        consecutiveFailureThreshold: 8,
+        openCooldown: 20,
+        openCooldownMax: 300
+      }
+    }
   }
 }
 

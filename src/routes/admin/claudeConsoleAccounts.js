@@ -14,6 +14,8 @@ const redis = require('../../models/redis')
 const { authenticateAdmin } = require('../../middleware/auth')
 const logger = require('../../utils/logger')
 const webhookNotifier = require('../../utils/webhookNotifier')
+const circuitBreaker = require('../../utils/circuitBreaker')
+const upstreamErrorHelper = require('../../utils/upstreamErrorHelper')
 const { formatAccountExpiry, mapExpiryField } = require('./utils')
 
 // 获取所有Claude Console账户
@@ -481,6 +483,56 @@ router.post('/claude-console-accounts/reset-all-usage', authenticateAdmin, async
       .json({ error: 'Failed to reset all daily usage', message: error.message })
   }
 })
+
+// 🧯 获取Claude Console账户的熔断器状态
+router.get(
+  '/claude-console-accounts/:accountId/circuit-status',
+  authenticateAdmin,
+  async (req, res) => {
+    const { accountId } = req.params
+    try {
+      const account = await claudeConsoleAccountService.getAccount(accountId)
+      if (!account) {
+        return res.status(404).json({ error: 'Account not found' })
+      }
+      const state = await circuitBreaker.getState(accountId)
+      const policy = claudeConsoleAccountService.resolveErrorPolicy(account)
+      return res.json({
+        success: true,
+        accountId,
+        upstreamType: account.upstreamType || 'adaptive',
+        errorPolicy: account.errorPolicy || null,
+        resolvedPolicy: policy,
+        circuit: state
+      })
+    } catch (error) {
+      logger.error(`❌ Failed to get circuit status for ${accountId}:`, error)
+      return res.status(500).json({ error: error.message })
+    }
+  }
+)
+
+// 🧹 手动重置Claude Console账户的熔断器状态
+router.post(
+  '/claude-console-accounts/:accountId/circuit-reset',
+  authenticateAdmin,
+  async (req, res) => {
+    const { accountId } = req.params
+    try {
+      const account = await claudeConsoleAccountService.getAccount(accountId)
+      if (!account) {
+        return res.status(404).json({ error: 'Account not found' })
+      }
+      await circuitBreaker.clear(accountId)
+      await upstreamErrorHelper.clearTempUnavailable(accountId, 'claude-console').catch(() => {})
+      logger.success(`🧹 Circuit breaker manually reset for Claude Console account ${accountId}`)
+      return res.json({ success: true, message: 'Circuit breaker state cleared' })
+    } catch (error) {
+      logger.error(`❌ Failed to reset circuit for ${accountId}:`, error)
+      return res.status(500).json({ error: error.message })
+    }
+  }
+)
 
 // 测试Claude Console账户连通性（流式响应）- 复用 claudeConsoleRelayService
 router.post('/claude-console-accounts/:accountId/test', authenticateAdmin, async (req, res) => {

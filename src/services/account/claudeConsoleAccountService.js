@@ -7,6 +7,58 @@ const config = require('../../../config/config')
 const LRUCache = require('../../utils/lruCache')
 const upstreamErrorHelper = require('../../utils/upstreamErrorHelper')
 
+const ALLOWED_UPSTREAM_TYPES = ['direct', 'adaptive', 'aggregator']
+const DEFAULT_UPSTREAM_TYPE = 'adaptive'
+
+const ALLOWED_POLICY_KEYS = [
+  'retryOnTransient',
+  'window',
+  'minSamples',
+  'errorRateThreshold',
+  'consecutiveFailureThreshold',
+  'openCooldown',
+  'openCooldownMax'
+]
+
+const normalizeErrorPolicy = (raw) => {
+  if (!raw) {
+    return null
+  }
+  let source = raw
+  if (typeof raw === 'string') {
+    const trimmed = raw.trim()
+    if (!trimmed) {
+      return null
+    }
+    try {
+      source = JSON.parse(trimmed)
+    } catch {
+      return null
+    }
+  }
+  if (!source || typeof source !== 'object') {
+    return null
+  }
+  const normalized = {}
+  for (const key of ALLOWED_POLICY_KEYS) {
+    const value = source[key]
+    if (value === undefined || value === null || value === '') {
+      continue
+    }
+    const parsed = Number(value)
+    if (!Number.isFinite(parsed) || parsed < 0) {
+      continue
+    }
+    normalized[key] = key === 'errorRateThreshold' ? Math.min(1, parsed) : Math.floor(parsed)
+  }
+  return Object.keys(normalized).length === 0 ? null : normalized
+}
+
+const normalizeUpstreamType = (raw) => {
+  const value = typeof raw === 'string' ? raw.trim().toLowerCase() : ''
+  return ALLOWED_UPSTREAM_TYPES.includes(value) ? value : DEFAULT_UPSTREAM_TYPE
+}
+
 class ClaudeConsoleAccountService {
   constructor() {
     // 加密相关常量
@@ -70,8 +122,13 @@ class ClaudeConsoleAccountService {
       quotaResetTime = '00:00', // 额度重置时间（HH:mm格式）
       maxConcurrentTasks = 0, // 最大并发任务数，0表示无限制
       disableAutoProtection = false, // 是否关闭自动防护（429/401/400/529 不自动禁用）
-      interceptWarmup = false // 拦截预热请求（标题生成、Warmup等）
+      interceptWarmup = false, // 拦截预热请求（标题生成、Warmup等）
+      upstreamType = DEFAULT_UPSTREAM_TYPE, // 上游类型：direct/adaptive/aggregator，决定熔断策略 preset
+      errorPolicy = null // 账户级熔断策略覆盖（null=使用 preset）
     } = options
+
+    const normalizedUpstreamType = normalizeUpstreamType(upstreamType)
+    const normalizedErrorPolicy = normalizeErrorPolicy(errorPolicy)
 
     // 验证必填字段
     if (!apiUrl || !apiKey) {
@@ -120,7 +177,9 @@ class ClaudeConsoleAccountService {
       quotaStoppedAt: '', // 因额度停用的时间
       maxConcurrentTasks: maxConcurrentTasks.toString(), // 最大并发任务数，0表示无限制
       disableAutoProtection: disableAutoProtection.toString(), // 关闭自动防护
-      interceptWarmup: interceptWarmup.toString() // 拦截预热请求
+      interceptWarmup: interceptWarmup.toString(), // 拦截预热请求
+      upstreamType: normalizedUpstreamType,
+      errorPolicy: normalizedErrorPolicy ? JSON.stringify(normalizedErrorPolicy) : ''
     }
 
     const client = redis.getClientSafe()
@@ -161,6 +220,8 @@ class ClaudeConsoleAccountService {
       maxConcurrentTasks, // 新增：返回并发限制配置
       disableAutoProtection, // 新增：返回自动防护开关
       interceptWarmup, // 新增：返回预热请求拦截开关
+      upstreamType: normalizedUpstreamType,
+      errorPolicy: normalizedErrorPolicy,
       activeTaskCount: 0 // 新增：新建账户当前并发数为0
     }
   }
@@ -231,7 +292,10 @@ class ClaudeConsoleAccountService {
             activeTaskCount,
             disableAutoProtection: accountData.disableAutoProtection === 'true',
             // 拦截预热请求
-            interceptWarmup: accountData.interceptWarmup === 'true'
+            interceptWarmup: accountData.interceptWarmup === 'true',
+            // 熔断器相关
+            upstreamType: normalizeUpstreamType(accountData.upstreamType),
+            errorPolicy: normalizeErrorPolicy(accountData.errorPolicy)
           })
         }
       }
@@ -287,6 +351,10 @@ class ClaudeConsoleAccountService {
     accountData.maxConcurrentTasks = parseInt(accountData.maxConcurrentTasks) || 0
     // 获取实时并发计数
     accountData.activeTaskCount = await redis.getConsoleAccountConcurrency(accountId)
+
+    // 熔断器相关字段：缺失时默认 adaptive preset
+    accountData.upstreamType = normalizeUpstreamType(accountData.upstreamType)
+    accountData.errorPolicy = normalizeErrorPolicy(accountData.errorPolicy)
 
     logger.debug(
       `[DEBUG] Final account data - name: ${accountData.name}, hasApiUrl: ${!!accountData.apiUrl}, hasApiKey: ${!!accountData.apiKey}, supportedModels: ${JSON.stringify(accountData.supportedModels)}`
@@ -391,6 +459,22 @@ class ClaudeConsoleAccountService {
       }
       if (updates.interceptWarmup !== undefined) {
         updatedData.interceptWarmup = updates.interceptWarmup.toString()
+      }
+
+      // 熔断器相关字段
+      if (updates.upstreamType !== undefined) {
+        const raw =
+          typeof updates.upstreamType === 'string' ? updates.upstreamType.trim().toLowerCase() : ''
+        if (raw && !ALLOWED_UPSTREAM_TYPES.includes(raw)) {
+          throw new Error(
+            `Invalid upstreamType: ${updates.upstreamType}. Allowed: ${ALLOWED_UPSTREAM_TYPES.join(', ')}`
+          )
+        }
+        updatedData.upstreamType = raw || DEFAULT_UPSTREAM_TYPE
+      }
+      if (updates.errorPolicy !== undefined) {
+        const normalized = normalizeErrorPolicy(updates.errorPolicy)
+        updatedData.errorPolicy = normalized ? JSON.stringify(normalized) : ''
       }
 
       // ✅ 直接保存 subscriptionExpiresAt（如果提供）
@@ -1626,6 +1710,12 @@ class ClaudeConsoleAccountService {
       logger.error(`❌ Failed to check count_tokens availability for account ${accountId}:`, error)
       return false // 出错时默认返回可用，避免误阻断
     }
+  }
+
+  // 🧮 解析账户的熔断策略：按 upstreamType 取 preset，与账户级 errorPolicy 合并
+  resolveErrorPolicy(account) {
+    const circuitBreaker = require('../../utils/circuitBreaker')
+    return circuitBreaker.resolvePolicyFromAccount(account)
   }
 }
 
