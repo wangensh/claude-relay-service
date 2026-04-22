@@ -371,24 +371,38 @@ class ClaudeConsoleRelayService {
           await claudeConsoleAccountService.markConsoleAccountBlocked(accountId, errorDetails)
         }
       } else if (response.status === 429) {
-        logger.warn(
-          `🚫 Rate limit detected for Claude Console account ${accountId}${autoProtectionDisabled ? ' (auto-protection disabled, skipping status change)' : ''}`
-        )
-        // 收到429先检查是否因为超过了手动配置的每日额度
-        await claudeConsoleAccountService.checkQuotaUsage(accountId).catch((err) => {
-          logger.error('❌ Failed to check quota after 429 error:', err)
-        })
-
-        if (!autoProtectionDisabled) {
-          await claudeConsoleAccountService.markAccountRateLimited(accountId)
-          await upstreamErrorHelper
-            .markTempUnavailable(
-              accountId,
-              'claude-console',
-              429,
-              upstreamErrorHelper.parseRetryAfter(response.headers)
-            )
-            .catch(() => {})
+        // 🎭 识别"假 429"：上游把 overload/congestion 包装成 429
+        // 真 429 → markAccountRateLimited + markTempUnavailable(429)
+        // 假 429 → 当 529 overload 处理，走熔断器重试+滑动窗口
+        const fakeRateLimit = upstreamErrorHelper.isFakeRateLimit(response.data, response.headers)
+        if (fakeRateLimit) {
+          logger.warn(
+            `🎭 Fake 429 (upstream overload) for Claude Console account ${accountId}${autoProtectionDisabled ? ' (auto-protection disabled, skipping circuit breaker)' : ''}`
+          )
+          if (!autoProtectionDisabled) {
+            await circuitBreaker
+              .recordFailure(accountId, 529, { probe: isProbeRequest, reason: 'fake_429' })
+              .catch((err) => logger.warn(`circuitBreaker.recordFailure failed: ${err.message}`))
+          }
+        } else {
+          logger.warn(
+            `🚫 Rate limit detected for Claude Console account ${accountId}${autoProtectionDisabled ? ' (auto-protection disabled, skipping status change)' : ''}`
+          )
+          // 收到 429 先检查是否因为超过了手动配置的每日额度
+          await claudeConsoleAccountService.checkQuotaUsage(accountId).catch((err) => {
+            logger.error('❌ Failed to check quota after 429 error:', err)
+          })
+          if (!autoProtectionDisabled) {
+            await claudeConsoleAccountService.markAccountRateLimited(accountId)
+            await upstreamErrorHelper
+              .markTempUnavailable(
+                accountId,
+                'claude-console',
+                429,
+                upstreamErrorHelper.parseRetryAfter(response.headers)
+              )
+              .catch(() => {})
+          }
         }
       } else if (response.status === 529 || response.status >= 500) {
         logger.warn(
@@ -925,23 +939,43 @@ class ClaudeConsoleRelayService {
                   )
                 }
               } else if (response.status === 429) {
-                logger.warn(
-                  `🚫 [Stream] Rate limit detected for Claude Console account ${accountId}${autoProtectionDisabled ? ' (auto-protection disabled, skipping status change)' : ''}`
+                const fakeRateLimit = upstreamErrorHelper.isFakeRateLimit(
+                  errorDataForCheck,
+                  response.headers
                 )
-                // 检查是否因为超过每日额度
-                claudeConsoleAccountService.checkQuotaUsage(accountId).catch((err) => {
-                  logger.error('❌ Failed to check quota after 429 error:', err)
-                })
-                if (!autoProtectionDisabled) {
-                  await claudeConsoleAccountService.markAccountRateLimited(accountId)
-                  await upstreamErrorHelper
-                    .markTempUnavailable(
-                      accountId,
-                      'claude-console',
-                      429,
-                      upstreamErrorHelper.parseRetryAfter(response.headers)
-                    )
-                    .catch(() => {})
+                if (fakeRateLimit) {
+                  logger.warn(
+                    `🎭 [Stream] Fake 429 (upstream overload) for Claude Console account ${accountId}${autoProtectionDisabled ? ' (auto-protection disabled, skipping circuit breaker)' : ''}`
+                  )
+                  if (!autoProtectionDisabled) {
+                    await circuitBreaker
+                      .recordFailure(accountId, 529, {
+                        probe: isProbeRequestStream,
+                        reason: 'fake_429'
+                      })
+                      .catch((err) =>
+                        logger.warn(`circuitBreaker.recordFailure failed: ${err.message}`)
+                      )
+                  }
+                } else {
+                  logger.warn(
+                    `🚫 [Stream] Rate limit detected for Claude Console account ${accountId}${autoProtectionDisabled ? ' (auto-protection disabled, skipping status change)' : ''}`
+                  )
+                  // 检查是否因为超过每日额度
+                  claudeConsoleAccountService.checkQuotaUsage(accountId).catch((err) => {
+                    logger.error('❌ Failed to check quota after 429 error:', err)
+                  })
+                  if (!autoProtectionDisabled) {
+                    await claudeConsoleAccountService.markAccountRateLimited(accountId)
+                    await upstreamErrorHelper
+                      .markTempUnavailable(
+                        accountId,
+                        'claude-console',
+                        429,
+                        upstreamErrorHelper.parseRetryAfter(response.headers)
+                      )
+                      .catch(() => {})
+                  }
                 }
               } else if (response.status === 529 || response.status >= 500) {
                 logger.warn(

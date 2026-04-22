@@ -162,6 +162,89 @@ const classifyError = (statusCode) => {
   return null
 }
 
+// 识别"假 429"：上游 HTTP 状态码是 429 但实际语义是 overload/congestion/聚合上游某一路抖动，
+// 而非"针对 Claude Relay 调用方的用户级限流"。
+// 返回 true 表示应当按 overload（529）处理：走熔断器重试+滑动窗口，而非 5 分钟限流屏蔽
+//
+// 两类命中信号：
+// 1) 业务侧"上游过载"语义：overload/capacity/负载/饱和 等
+// 2) 聚合上游透传的 SDK 错误：ThrottlingException / InvokeModel / Bedrock Runtime /
+//    operation error / exceeded maximum number of attempts 等——这些都是上游内部的
+//    AWS SDK 错误细节被透传到响应里，本质上是"上游背后的某个账户"被限流，跟我方无关
+const FAKE_RATE_LIMIT_KEYWORDS = [
+  // 过载语义
+  'overload',
+  'overloaded',
+  'capacity',
+  'saturated',
+  'saturation',
+  'congestion',
+  'congested',
+  'busy',
+  'backend',
+  'upstream',
+  '负载',
+  '饱和',
+  '繁忙',
+  '拥塞',
+  '容量',
+  // 聚合上游透传的 AWS Bedrock SDK 错误特征（Claude Console 上游不应直接暴露这些内部细节，
+  // 出现即说明是上游把内部错误透传了过来，我方视角下是瞬时错误）
+  'throttlingexception',
+  'invokemodel',
+  'bedrock runtime',
+  'operation error',
+  'exceeded maximum number of attempts'
+]
+const REAL_RATE_LIMIT_KEYWORDS = ['rate limit', 'quota', 'per-minute', 'per-day', 'tpm', 'rpm']
+
+const isFakeRateLimit = (responseBody, responseHeaders) => {
+  try {
+    let payload = responseBody
+    if (typeof payload === 'string') {
+      try {
+        payload = JSON.parse(payload)
+      } catch {
+        // 纯字符串 body：按消息文本处理
+        payload = { message: responseBody }
+      }
+    }
+    if (!payload || typeof payload !== 'object') {
+      return false
+    }
+
+    // 提取 error.type 和 message
+    const errorType = String(payload.error?.type || payload.type || '').toLowerCase()
+    const message = String(
+      payload.error?.message || payload.message || payload.error || ''
+    ).toLowerCase()
+
+    // 真 rate_limit_error 直接 false（保留原限流语义）
+    if (errorType === 'rate_limit_error') {
+      return false
+    }
+
+    // 带 Retry-After 头 + 消息里有 rate/quota 字眼 → 真限流
+    const hasRetryAfter =
+      responseHeaders &&
+      (responseHeaders['retry-after'] || responseHeaders['anthropic-ratelimit-unified-reset'])
+    if (hasRetryAfter && REAL_RATE_LIMIT_KEYWORDS.some((kw) => message.includes(kw))) {
+      return false
+    }
+
+    // 命中"假 429"关键词（overload/负载/饱和 等）→ 假
+    if (FAKE_RATE_LIMIT_KEYWORDS.some((kw) => message.includes(kw))) {
+      return true
+    }
+
+    // 其他情况保守处理：按真限流语义走，保留 5 分钟冷却
+    // （避免把模糊场景都吞进熔断器，引入不必要的行为变化）
+    return false
+  } catch {
+    return false
+  }
+}
+
 // 解析 429 响应头中的重置时间（返回秒数）
 const parseRetryAfter = (headers) => {
   if (!headers) {
@@ -499,6 +582,7 @@ module.exports = {
   clearTempUnavailable,
   getAllTempUnavailable,
   classifyError,
+  isFakeRateLimit,
   parseRetryAfter,
   sanitizeErrorForClient,
   recordErrorHistory,
