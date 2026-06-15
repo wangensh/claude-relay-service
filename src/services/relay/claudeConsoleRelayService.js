@@ -426,6 +426,23 @@ class ClaudeConsoleRelayService {
           typeof response.data === 'string' ? response.data : JSON.stringify(response.data)
       }
 
+      // 模型映射响应修正：将上游返回的model替换为原始请求的model
+      if (mappedModel !== requestBody.model) {
+        try {
+          const responseJson = JSON.parse(responseBody)
+          if (responseJson.model && responseJson.model !== requestBody.model) {
+            const upstreamModel = responseJson.model
+            responseJson.model = requestBody.model
+            responseBody = JSON.stringify(responseJson)
+            logger.debug(
+              `🔄 Replaced response model from "${upstreamModel}" to "${requestBody.model}"`
+            )
+          }
+        } catch (_) {
+          // 非JSON响应，保持原样
+        }
+      }
+
       logger.debug(`[DEBUG] Final response body to return: ${responseBody.substring(0, 200)}...`)
 
       return {
@@ -681,7 +698,8 @@ class ClaudeConsoleRelayService {
               )
             }
           }
-        }
+        },
+        requestBody.model
       )
 
       // 更新最后使用时间
@@ -751,7 +769,8 @@ class ClaudeConsoleRelayService {
     usageCallback,
     streamTransformer = null,
     requestOptions = {},
-    onResponseHeaderReceived = null
+    onResponseHeaderReceived = null,
+    originalModel = null
   ) {
     return new Promise((resolve, reject) => {
       let aborted = false
@@ -1015,14 +1034,26 @@ class ClaudeConsoleRelayService {
 
               // 转发数据并解析usage
               if (lines.length > 0) {
+                // 模型映射响应修正：将SSE行中message_start事件的model替换为原始请求的model
+                let linesToForward = lines
+                if (originalModel && body.model !== originalModel) {
+                  linesToForward = lines.map((line) => {
+                    if (line.startsWith('data:')) {
+                      return line.replace(/"model":"[^"]*"/, `"model":"${originalModel}"`)
+                    }
+                    return line
+                  })
+                }
+
                 // 检查流是否可写（客户端连接是否有效）
                 if (isStreamWritable(responseStream)) {
-                  const linesToForward = lines.join('\n') + (lines.length > 0 ? '\n' : '')
+                  const forwardStr =
+                    linesToForward.join('\n') + (linesToForward.length > 0 ? '\n' : '')
 
                   // 应用流转换器如果有
-                  let dataToWrite = linesToForward
+                  let dataToWrite = forwardStr
                   if (streamTransformer) {
-                    const transformed = streamTransformer(linesToForward)
+                    const transformed = streamTransformer(forwardStr)
                     if (transformed) {
                       dataToWrite = transformed
                     } else {
