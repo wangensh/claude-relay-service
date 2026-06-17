@@ -1258,7 +1258,8 @@ async function handleMessagesRequest(req, res) {
 
           const cacheReadTokens = jsonData.usage.cache_read_input_tokens || 0
           // Parse the model to remove vendor prefix if present (e.g., "ccr,gemini-2.5-pro" -> "gemini-2.5-pro")
-          const rawModel = jsonData.model || _requestBodyNonStream.model || 'unknown'
+          // 优先使用客户端请求的 model，确保模型映射时计费使用原始请求模型名
+          const rawModel = _requestBodyNonStream.model || jsonData.model || 'unknown'
           const { baseModel: usageBaseModel } = parseVendorPrefixedModel(rawModel)
           const model = usageBaseModel || rawModel
 

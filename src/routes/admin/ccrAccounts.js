@@ -417,7 +417,7 @@ router.post('/reset-all-usage', authenticateAdmin, async (req, res) => {
 // 测试 CCR 账户连通性
 router.post('/:accountId/test', authenticateAdmin, async (req, res) => {
   const { accountId } = req.params
-  const { model = 'claude-sonnet-4-20250514' } = req.body
+  const { model: rawModel = 'claude-sonnet-4-20250514' } = req.body
   const startTime = Date.now()
 
   try {
@@ -425,6 +425,20 @@ router.post('/:accountId/test', authenticateAdmin, async (req, res) => {
     const account = await ccrAccountService.getAccount(accountId)
     if (!account) {
       return res.status(404).json({ error: 'Account not found' })
+    }
+
+    // 处理模型映射（与 ccrRelayService 保持一致）
+    let model = rawModel
+    if (
+      account.supportedModels &&
+      typeof account.supportedModels === 'object' &&
+      !Array.isArray(account.supportedModels)
+    ) {
+      const newModel = ccrAccountService.getMappedModel(account.supportedModels, rawModel)
+      if (newModel !== rawModel) {
+        logger.info(`🔄 [CCR Test] Mapping model from ${rawModel} to ${newModel}`)
+        model = newModel
+      }
     }
 
     // 获取解密后的凭据

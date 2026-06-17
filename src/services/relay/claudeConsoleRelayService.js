@@ -1088,7 +1088,7 @@ class ClaudeConsoleRelayService {
                           data.message.usage.cache_creation_input_tokens || 0
                         collectedUsageData.cache_read_input_tokens =
                           data.message.usage.cache_read_input_tokens || 0
-                        collectedUsageData.model = data.message.model
+                        collectedUsageData.model = originalModel || data.message.model
 
                         // 检查是否有详细的 cache_creation 对象
                         if (
@@ -1154,7 +1154,8 @@ class ClaudeConsoleRelayService {
                           !finalUsageReported
                         ) {
                           if (!collectedUsageData.model) {
-                            collectedUsageData.model = body.model || account?.defaultModel || null
+                            collectedUsageData.model =
+                              originalModel || body.model || account?.defaultModel || null
                           }
                           logger.info(
                             '🎯 [Console] Complete usage data collected:',
@@ -1234,7 +1235,8 @@ class ClaudeConsoleRelayService {
                   }
                   // 确保有 model 字段
                   if (!collectedUsageData.model) {
-                    collectedUsageData.model = body.model || account?.defaultModel || null
+                    collectedUsageData.model =
+                      originalModel || body.model || account?.defaultModel || null
                   }
                   logger.info(
                     `📊 [Console] Saving incomplete usage data via fallback: ${JSON.stringify(collectedUsageData)}`
@@ -1500,11 +1502,25 @@ class ClaudeConsoleRelayService {
 
       logger.info(`🧪 Testing Claude Console account connection: ${account.name} (${accountId})`)
 
+      // 处理模型映射（与 relayRequest / relayStreamRequestWithUsageCapture 保持一致）
+      let mappedModel = model
+      if (
+        account.supportedModels &&
+        typeof account.supportedModels === 'object' &&
+        !Array.isArray(account.supportedModels)
+      ) {
+        const newModel = claudeConsoleAccountService.getMappedModel(account.supportedModels, model)
+        if (newModel !== model) {
+          logger.info(`🔄 [Test] Mapping model from ${model} to ${newModel}`)
+          mappedModel = newModel
+        }
+      }
+
       const cleanUrl = account.apiUrl.replace(/\/$/, '')
       const apiUrl = cleanUrl.endsWith('/v1/messages')
         ? cleanUrl
         : `${cleanUrl}/v1/messages?beta=true`
-      const payload = createClaudeTestPayload(model, { stream: true })
+      const payload = createClaudeTestPayload(mappedModel, { stream: true })
 
       const extraHeaders = account.userAgent ? { 'User-Agent': account.userAgent } : {}
       const requestOptions = {

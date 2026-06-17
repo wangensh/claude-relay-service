@@ -1028,6 +1028,23 @@ class ClaudeRelayService {
         )
       }
 
+      // 模型映射响应修正：将上游返回的model替换为原始请求的model
+      if (response.body && requestBody.model) {
+        try {
+          const responseJson = JSON.parse(response.body)
+          if (responseJson.model && responseJson.model !== requestBody.model) {
+            const upstreamModel = responseJson.model
+            responseJson.model = requestBody.model
+            response.body = JSON.stringify(responseJson)
+            logger.debug(
+              `🔄 Replaced response model from "${upstreamModel}" to "${requestBody.model}"`
+            )
+          }
+        } catch (_) {
+          // 非JSON响应，保持原样
+        }
+      }
+
       // 在响应中添加accountId，以便调用方记录账户级别统计
       response.accountId = accountId
       return response
@@ -2852,7 +2869,7 @@ class ClaudeRelayService {
               output_tokens: totalUsage.output_tokens,
               cache_creation_input_tokens: totalUsage.cache_creation_input_tokens,
               cache_read_input_tokens: totalUsage.cache_read_input_tokens,
-              model: allUsageData[allUsageData.length - 1].model || requestedModel // 使用最后一个模型或请求模型
+              model: requestedModel // 始终使用请求的模型名进行计费
             }
 
             // 如果有详细的cache_creation数据，合并它们

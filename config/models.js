@@ -4,15 +4,9 @@
  */
 
 const CLAUDE_MODELS = [
-  { value: 'claude-opus-4-6', label: 'Claude Opus 4.6' },
-  { value: 'claude-sonnet-4-6', label: 'Claude Sonnet 4.6' },
-  { value: 'claude-opus-4-5-20251101', label: 'Claude Opus 4.5' },
-  { value: 'claude-sonnet-4-5-20250929', label: 'Claude Sonnet 4.5' },
-  { value: 'claude-sonnet-4-20250514', label: 'Claude Sonnet 4' },
-  { value: 'claude-opus-4-1-20250805', label: 'Claude Opus 4.1' },
-  { value: 'claude-opus-4-20250514', label: 'Claude Opus 4' },
   { value: 'claude-haiku-4-5-20251001', label: 'Claude Haiku 4.5' },
-  { value: 'claude-3-5-haiku-20241022', label: 'Claude 3.5 Haiku' }
+  { value: 'claude-sonnet-4-6', label: 'Claude Sonnet 4.6' },
+  { value: 'claude-opus-4-8', label: 'Claude Opus 4.8' }
 ]
 
 const GEMINI_MODELS = [
@@ -41,10 +35,9 @@ const OPENAI_MODELS = [
 ]
 
 const BEDROCK_MODELS = [
-  { value: 'us.anthropic.claude-opus-4-6-20250610-v1:0', label: 'Claude Opus 4.6' },
-  { value: 'us.anthropic.claude-sonnet-4-5-20250929-v1:0', label: 'Claude Sonnet 4.5' },
-  { value: 'us.anthropic.claude-sonnet-4-20250514-v1:0', label: 'Claude Sonnet 4' },
-  { value: 'us.anthropic.claude-3-5-haiku-20241022-v1:0', label: 'Claude 3.5 Haiku' }
+  { value: 'us.anthropic.claude-haiku-4-5-20251001-v1:0', label: 'Claude Haiku 4.5' },
+  { value: 'us.anthropic.claude-sonnet-4-6-20250610-v1:0', label: 'Claude Sonnet 4.6' },
+  { value: 'us.anthropic.claude-opus-4-8-20250610-v1:0', label: 'Claude Opus 4.8' }
 ]
 
 // 其他模型（用于账户编辑的模型映射）
