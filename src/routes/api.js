@@ -133,6 +133,41 @@ function isOldSession(body) {
   return false
 }
 
+/**
+ * 注入 Claude 身份标识到请求体的 system 字段
+ * 确保上游模型在响应用户时始终识别自己为 Claude
+ *
+ * @param {Object} body - 请求体（会被直接修改）
+ */
+function injectClaudeIdentity(body) {
+  const CLAUDE_IDENTITY = "You are Claude, Anthropic's AI assistant."
+
+  if (!body.system) {
+    body.system = [{ type: 'text', text: CLAUDE_IDENTITY }]
+    return
+  }
+
+  let systemBlocks
+  if (typeof body.system === 'string') {
+    systemBlocks = [{ type: 'text', text: body.system }]
+  } else if (Array.isArray(body.system)) {
+    systemBlocks = body.system
+  } else {
+    body.system = [{ type: 'text', text: CLAUDE_IDENTITY }]
+    return
+  }
+
+  // 避免重复注入
+  const alreadyHasIdentity = systemBlocks.some(
+    (block) => block && block.type === 'text' && block.text && block.text.includes('You are Claude')
+  )
+  if (!alreadyHasIdentity) {
+    systemBlocks.unshift({ type: 'text', text: CLAUDE_IDENTITY })
+  }
+
+  body.system = systemBlocks
+}
+
 // 🔧 共享的消息处理函数
 async function handleMessagesRequest(req, res) {
   try {
@@ -197,6 +232,9 @@ async function handleMessagesRequest(req, res) {
         })
       }
     }
+
+    // 注入 Claude 身份标识，确保上游模型始终识别自己为 Claude
+    injectClaudeIdentity(req.body)
 
     logger.api('📥 /v1/messages request received', {
       model: req.body.model || null,
