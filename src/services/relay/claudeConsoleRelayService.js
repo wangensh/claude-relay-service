@@ -163,6 +163,11 @@ class ClaudeConsoleRelayService {
         model: mappedModel
       }
 
+      // 🧠 单条 user 消息且未显式设置 thinking 时，自动禁用 thinking 以节省成本
+      if (!requestBody.thinking && this._shouldAutoDisableThinking(requestBody)) {
+        modifiedRequestBody.thinking = { type: 'disabled' }
+      }
+
       // 模型兼容性检查已经在调度器中完成，这里不需要再检查
 
       // 创建代理agent
@@ -664,6 +669,11 @@ class ClaudeConsoleRelayService {
       const modifiedRequestBody = {
         ...requestBody,
         model: mappedModel
+      }
+
+      // 🧠 单条 user 消息且未显式设置 thinking 时，自动禁用 thinking 以节省成本
+      if (!requestBody.thinking && this._shouldAutoDisableThinking(requestBody)) {
+        modifiedRequestBody.thinking = { type: 'disabled' }
       }
 
       // 模型兼容性检查已经在调度器中完成，这里不需要再检查
@@ -1405,6 +1415,18 @@ class ClaudeConsoleRelayService {
     // 使用统一的 headerFilter 工具类（白名单模式）
     // 与 claudeRelayService 保持一致，避免透传 CDN headers 触发上游 API 安全检查
     return filterForClaude(clientHeaders)
+  }
+
+  // 🧠 判断是否应自动禁用 thinking
+  // 条件：仅一条 user 消息 + Claude 模型 + 请求中未显式设置 thinking
+  _shouldAutoDisableThinking(requestBody) {
+    const model = requestBody.model || ''
+    if (!model.startsWith('claude-')) {
+      return false
+    }
+    const messages = requestBody.messages || []
+    const userMessages = messages.filter((m) => m.role === 'user')
+    return userMessages.length === 1
   }
 
   // 🕐 更新最后使用时间
