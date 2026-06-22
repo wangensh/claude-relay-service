@@ -168,6 +168,9 @@ class ClaudeConsoleRelayService {
         modifiedRequestBody.thinking = { type: 'disabled' }
       }
 
+      // 🧭 OpenRouter + DeepSeek：注入 provider.order 优先使用 deepseek
+      this._maybeInjectOpenRouterProviderOrder(modifiedRequestBody, account)
+
       // 模型兼容性检查已经在调度器中完成，这里不需要再检查
 
       // 创建代理agent
@@ -675,6 +678,9 @@ class ClaudeConsoleRelayService {
       if (!requestBody.thinking && this._shouldAutoDisableThinking(requestBody)) {
         modifiedRequestBody.thinking = { type: 'disabled' }
       }
+
+      // 🧭 OpenRouter + DeepSeek：注入 provider.order 优先使用 deepseek
+      this._maybeInjectOpenRouterProviderOrder(modifiedRequestBody, account)
 
       // 模型兼容性检查已经在调度器中完成，这里不需要再检查
 
@@ -1427,6 +1433,27 @@ class ClaudeConsoleRelayService {
     const messages = requestBody.messages || []
     const userMessages = messages.filter((m) => m.role === 'user')
     return userMessages.length === 1
+  }
+
+  // 🧭 OpenRouter + DeepSeek：强制优先使用 deepseek 作为底层 provider
+  // 当账户上游是 OpenRouter（apiUrl 含 openrouter）且上游模型名含 deepseek 时，
+  // 注入 provider.order=['deepseek']；若请求体已显式带有 provider 则不覆盖
+  _maybeInjectOpenRouterProviderOrder(modifiedRequestBody, account) {
+    if (modifiedRequestBody.provider) {
+      return
+    }
+    const isOpenRouter = String(account?.apiUrl || '')
+      .toLowerCase()
+      .includes('openrouter')
+    const isDeepSeekModel = String(modifiedRequestBody.model || '')
+      .toLowerCase()
+      .includes('deepseek')
+    if (isOpenRouter && isDeepSeekModel) {
+      modifiedRequestBody.provider = { order: ['deepseek'] }
+      logger.info(
+        `🧭 OpenRouter DeepSeek request: injecting provider.order=['deepseek'] for model ${modifiedRequestBody.model}`
+      )
+    }
   }
 
   // 🕐 更新最后使用时间
