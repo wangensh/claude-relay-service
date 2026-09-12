@@ -15,6 +15,7 @@ const { authenticateAdmin } = require('../../middleware/auth')
 const logger = require('../../utils/logger')
 const webhookNotifier = require('../../utils/webhookNotifier')
 const { formatAccountExpiry, mapExpiryField } = require('./utils')
+const { normalizeCustomRequestBody } = require('../../utils/customRequestBody')
 
 // 获取所有Claude Console账户
 router.get('/claude-console-accounts', authenticateAdmin, async (req, res) => {
@@ -125,6 +126,7 @@ router.post('/claude-console-accounts', authenticateAdmin, async (req, res) => {
       priority,
       supportedModels,
       userAgent,
+      customRequestBody,
       rateLimitDuration,
       proxy,
       accountType,
@@ -169,6 +171,13 @@ router.post('/claude-console-accounts', authenticateAdmin, async (req, res) => {
       return res.status(400).json({ error: 'Group ID is required for group type accounts' })
     }
 
+    let normalizedCustomRequestBody
+    try {
+      normalizedCustomRequestBody = normalizeCustomRequestBody(customRequestBody)
+    } catch (error) {
+      return res.status(400).json({ error: error.message })
+    }
+
     const newAccount = await claudeConsoleAccountService.createAccount({
       name,
       description,
@@ -177,6 +186,7 @@ router.post('/claude-console-accounts', authenticateAdmin, async (req, res) => {
       priority: priority || 50,
       supportedModels: supportedModels || [],
       userAgent,
+      customRequestBody: normalizedCustomRequestBody,
       rateLimitDuration:
         rateLimitDuration !== undefined && rateLimitDuration !== null ? rateLimitDuration : 60,
       proxy,
@@ -250,6 +260,16 @@ router.put('/claude-console-accounts/:accountId', authenticateAdmin, async (req,
     // 如果更新为分组类型，验证groupId
     if (mappedUpdates.accountType === 'group' && !mappedUpdates.groupId) {
       return res.status(400).json({ error: 'Group ID is required for group type accounts' })
+    }
+
+    if (mappedUpdates.customRequestBody !== undefined) {
+      try {
+        mappedUpdates.customRequestBody = normalizeCustomRequestBody(
+          mappedUpdates.customRequestBody
+        )
+      } catch (error) {
+        return res.status(400).json({ error: error.message })
+      }
     }
 
     // 获取账户当前信息以处理分组变更

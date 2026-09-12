@@ -6,6 +6,7 @@ const logger = require('../../utils/logger')
 const config = require('../../../config/config')
 const LRUCache = require('../../utils/lruCache')
 const upstreamErrorHelper = require('../../utils/upstreamErrorHelper')
+const { normalizeCustomRequestBody } = require('../../utils/customRequestBody')
 
 class ClaudeConsoleAccountService {
   constructor() {
@@ -61,6 +62,7 @@ class ClaudeConsoleAccountService {
       priority = 50, // 默认优先级50（1-100）
       supportedModels = [], // 支持的模型列表或映射表，空数组/对象表示支持所有
       userAgent = 'claude-cli/1.0.69 (external, cli)',
+      customRequestBody = {},
       rateLimitDuration = 60, // 限流时间（分钟）
       proxy = null,
       isActive = true,
@@ -78,6 +80,7 @@ class ClaudeConsoleAccountService {
       throw new Error('API URL and API Key are required for Claude Console account')
     }
 
+    const processedCustomRequestBody = normalizeCustomRequestBody(customRequestBody)
     const accountId = uuidv4()
 
     // 处理 supportedModels，确保向后兼容
@@ -93,6 +96,7 @@ class ClaudeConsoleAccountService {
       priority: priority.toString(),
       supportedModels: JSON.stringify(processedModels),
       userAgent,
+      customRequestBody: JSON.stringify(processedCustomRequestBody),
       rateLimitDuration: rateLimitDuration.toString(),
       proxy: proxy ? JSON.stringify(proxy) : '',
       isActive: isActive.toString(),
@@ -147,6 +151,7 @@ class ClaudeConsoleAccountService {
       priority,
       supportedModels,
       userAgent,
+      customRequestBody: processedCustomRequestBody,
       rateLimitDuration,
       isActive,
       proxy,
@@ -203,6 +208,7 @@ class ClaudeConsoleAccountService {
             priority: parseInt(accountData.priority) || 50,
             supportedModels: JSON.parse(accountData.supportedModels || '[]'),
             userAgent: accountData.userAgent,
+            customRequestBody: normalizeCustomRequestBody(accountData.customRequestBody),
             rateLimitDuration: Number.isNaN(parseInt(accountData.rateLimitDuration))
               ? 60
               : parseInt(accountData.rateLimitDuration),
@@ -269,6 +275,7 @@ class ClaudeConsoleAccountService {
     const parsedModels = JSON.parse(accountData.supportedModels || '[]')
     logger.debug(`[DEBUG] Parsed supportedModels: ${JSON.stringify(parsedModels)}`)
 
+    accountData.customRequestBody = normalizeCustomRequestBody(accountData.customRequestBody)
     accountData.supportedModels = parsedModels
     accountData.priority = parseInt(accountData.priority) || 50
     {
@@ -334,6 +341,11 @@ class ClaudeConsoleAccountService {
         // 处理 supportedModels，确保向后兼容
         const processedModels = this._processModelMapping(updates.supportedModels)
         updatedData.supportedModels = JSON.stringify(processedModels)
+      }
+      if (updates.customRequestBody !== undefined) {
+        updatedData.customRequestBody = JSON.stringify(
+          normalizeCustomRequestBody(updates.customRequestBody)
+        )
       }
       if (updates.userAgent !== undefined) {
         updatedData.userAgent = updates.userAgent

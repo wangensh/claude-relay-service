@@ -224,7 +224,7 @@ class ClaudeConsoleRelayService {
       const requestConfig = {
         method: 'POST',
         url: apiEndpoint,
-        data: modifiedRequestBody,
+        data: { ...modifiedRequestBody, ...account.customRequestBody },
         headers: {
           'Content-Type': 'application/json',
           'anthropic-version': '2023-06-01',
@@ -806,7 +806,7 @@ class ClaudeConsoleRelayService {
       const requestConfig = {
         method: 'POST',
         url: apiEndpoint,
-        data: body,
+        data: { ...body, ...account.customRequestBody },
         headers: {
           'Content-Type': 'application/json',
           'anthropic-version': '2023-06-01',
@@ -1542,7 +1542,10 @@ class ClaudeConsoleRelayService {
       const apiUrl = cleanUrl.endsWith('/v1/messages')
         ? cleanUrl
         : `${cleanUrl}/v1/messages?beta=true`
-      const payload = createClaudeTestPayload(mappedModel, { stream: true })
+      const payload = {
+        ...createClaudeTestPayload(mappedModel, { stream: true }),
+        ...account.customRequestBody
+      }
 
       const extraHeaders = account.userAgent ? { 'User-Agent': account.userAgent } : {}
       const requestOptions = {

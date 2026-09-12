@@ -1657,6 +1657,27 @@
                 </p>
               </div>
 
+              <div v-if="form.platform === 'claude-console'">
+                <label class="mb-3 block text-sm font-semibold text-gray-700 dark:text-gray-300">
+                  自定义请求 JSON (可选)
+                </label>
+                <textarea
+                  v-model="form.customRequestBody"
+                  class="form-input w-full font-mono text-sm dark:border-gray-600 dark:bg-gray-700 dark:text-gray-200"
+                  :placeholder="customRequestBodyPlaceholder"
+                  rows="8"
+                  spellcheck="false"
+                />
+                <p v-if="customRequestBodyError" class="mt-1 text-xs text-red-500">
+                  {{ customRequestBodyError }}
+                </p>
+                <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                  输入 JSON
+                  对象，按顶层字段合并到请求体，同名字段以此配置为准（嵌套对象整体替换）。留空不添加。
+                  可用于 OpenRouter 的 provider 设置，普通请求、流式请求和账户连通性测试均生效。
+                </p>
+              </div>
+
               <div>
                 <label class="mb-3 block text-sm font-semibold text-gray-700 dark:text-gray-300"
                   >限流机制</label
@@ -3567,6 +3588,27 @@
               </p>
             </div>
 
+            <div v-if="form.platform === 'claude-console'">
+              <label class="mb-3 block text-sm font-semibold text-gray-700 dark:text-gray-300">
+                自定义请求 JSON (可选)
+              </label>
+              <textarea
+                v-model="form.customRequestBody"
+                class="form-input w-full font-mono text-sm dark:border-gray-600 dark:bg-gray-700 dark:text-gray-200"
+                :placeholder="customRequestBodyPlaceholder"
+                rows="8"
+                spellcheck="false"
+              />
+              <p v-if="customRequestBodyError" class="mt-1 text-xs text-red-500">
+                {{ customRequestBodyError }}
+              </p>
+              <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                输入 JSON
+                对象，按顶层字段合并到请求体，同名字段以此配置为准（嵌套对象整体替换）。留空不添加。
+                可用于 OpenRouter 的 provider 设置，普通请求、流式请求和账户连通性测试均生效。
+              </p>
+            </div>
+
             <div>
               <label class="mb-3 block text-sm font-semibold text-gray-700">限流机制</label>
               <div class="mb-3">
@@ -4615,6 +4657,9 @@ const form = ref({
     return []
   })(),
   userAgent: props.account?.userAgent || '',
+  customRequestBody: props.account?.customRequestBody
+    ? JSON.stringify(props.account.customRequestBody, null, 2)
+    : '',
   enableRateLimit: props.account ? props.account.rateLimitDuration > 0 : true,
   disableAutoProtection: toFormBoolean(props.account?.disableAutoProtection),
   disableTempUnavailable: toFormBoolean(props.account?.disableTempUnavailable),
@@ -4795,6 +4840,24 @@ const currentApiKeyModeLabel = computed(() => {
 const currentApiKeyModeDescription = computed(() => {
   const option = apiKeyModeOptions.find((item) => item.value === form.value.apiKeyUpdateMode)
   return option ? option.description : apiKeyModeOptions[0].description
+})
+
+const customRequestBodyPlaceholder = JSON.stringify(
+  { provider: { order: ['anthropic'], allow_fallbacks: false } },
+  null,
+  2
+)
+const customRequestBodyError = computed(() => {
+  if (!form.value.customRequestBody.trim()) return ''
+  try {
+    const value = JSON.parse(form.value.customRequestBody)
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      return '请输入 JSON 对象，不能使用数组、null 或其他类型'
+    }
+    return ''
+  } catch {
+    return 'JSON 格式不正确，请检查引号、逗号和括号'
+  }
 })
 
 // 表单验证错误
@@ -5490,6 +5553,11 @@ const handleOAuthSuccess = async (tokenInfoOrList) => {
 
 // 创建账户（手动模式）
 const createAccount = async () => {
+  if (form.value.platform === 'claude-console' && customRequestBodyError.value) {
+    showToast(customRequestBodyError.value, 'error')
+    return
+  }
+
   // 清除之前的错误
   errors.value.name = ''
   errors.value.accessToken = ''
@@ -5811,6 +5879,7 @@ const createAccount = async () => {
       // 如果不启用限流，传递 0 表示不限流
       data.rateLimitDuration = form.value.enableRateLimit ? form.value.rateLimitDuration || 60 : 0
       if (form.value.platform === 'claude-console') {
+        data.customRequestBody = JSON.parse(form.value.customRequestBody.trim() || '{}')
         data.interceptWarmup = !!form.value.interceptWarmup
       }
       // 额度管理字段
@@ -5938,6 +6007,11 @@ const createAccount = async () => {
 
 // 更新账户
 const updateAccount = async () => {
+  if (form.value.platform === 'claude-console' && customRequestBodyError.value) {
+    showToast(customRequestBodyError.value, 'error')
+    return
+  }
+
   // 清除之前的错误
   errors.value.name = ''
   errors.value.apiKeys = ''
@@ -6159,6 +6233,7 @@ const updateAccount = async () => {
 
     // Claude Console 特定更新
     if (props.account.platform === 'claude-console') {
+      data.customRequestBody = JSON.parse(form.value.customRequestBody.trim() || '{}')
       data.apiUrl = form.value.apiUrl
       if (form.value.apiKey) {
         data.apiKey = form.value.apiKey
@@ -6821,6 +6896,9 @@ watch(
           return []
         })(),
         userAgent: newAccount.userAgent || '',
+        customRequestBody: newAccount.customRequestBody
+          ? JSON.stringify(newAccount.customRequestBody, null, 2)
+          : '',
         enableRateLimit:
           newAccount.rateLimitDuration && newAccount.rateLimitDuration > 0 ? true : false,
         rateLimitDuration: newAccount.rateLimitDuration || 60,
